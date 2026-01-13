@@ -198,23 +198,41 @@ def _unique_dest_path(dest_folder, name):
 def delete_with_checks(duplicates, manual_dir, manual_threshold=2):
     """
     For each duplicate pair:
-      - If distance > manual_threshold: move both files to manual_dir for manual inspection.
+      - If distance > manual_threshold: move both files into their own subfolder under `manual_dir` for manual inspection.
       - Else: keep the largest file and delete the other.
+
+    Each moved pair is placed in a folder named `pair_###` containing both files and an `info.txt` describing the pair.
     """
     os.makedirs(manual_dir, exist_ok=True)
-    moved_for_manual = []
+    moved_for_manual = []   # flat list of files moved
+    pair_dirs = []          # list of pair subfolders created
     deleted = []
     kept = []
+    pair_idx = 1
 
     for p1, p2, dist in duplicates:
         try:
             if dist > manual_threshold:
-                # move both for manual inspection
-                dest1 = _unique_dest_path(manual_dir, os.path.basename(p1))
-                dest2 = _unique_dest_path(manual_dir, os.path.basename(p2))
+                # create a subfolder for this pair
+                pair_name = f"pair_{pair_idx:03d}"
+                pair_dir = os.path.join(manual_dir, pair_name)
+                os.makedirs(pair_dir, exist_ok=True)
+
+                dest1 = _unique_dest_path(pair_dir, os.path.basename(p1))
+                dest2 = _unique_dest_path(pair_dir, os.path.basename(p2))
                 shutil.move(p1, dest1)
                 shutil.move(p2, dest2)
                 moved_for_manual.extend([dest1, dest2])
+                pair_dirs.append(pair_dir)
+
+                # write a small info file for manual inspection
+                try:
+                    with open(os.path.join(pair_dir, "info.txt"), "w") as f:
+                        f.write(f"Original1: {p1}\nOriginal2: {p2}\nDistance: {dist}\n")
+                except Exception:
+                    pass
+
+                pair_idx += 1
             else:
                 size1 = os.path.getsize(p1) if os.path.exists(p1) else -1
                 size2 = os.path.getsize(p2) if os.path.exists(p2) else -1
@@ -232,8 +250,8 @@ def delete_with_checks(duplicates, manual_dir, manual_threshold=2):
             print(f"Error processing pair ({p1}, {p2}): {e}")
 
     # summary
-    if moved_for_manual:
-        print(f"Moved {len(moved_for_manual)} files to manual check folder: {manual_dir}")
+    if pair_dirs:
+        print(f"Moved {len(pair_dirs)} pairs ({len(moved_for_manual)} files) to manual check folder: {manual_dir}")
     else:
         print("No files moved for manual check.")
 
@@ -247,7 +265,7 @@ def delete_with_checks(duplicates, manual_dir, manual_threshold=2):
     else:
         print("No files kept.")
 
-    return {"moved": moved_for_manual, "deleted": deleted, "kept": kept}
+    return {"moved": moved_for_manual, "moved_pairs": pair_dirs, "deleted": deleted, "kept": kept}
 
 
 def db_status(db_path):

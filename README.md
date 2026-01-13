@@ -47,6 +47,7 @@ Progress is enabled by default
   ```bash
   ./DuPiCheck.sh delete /path/to/images -M 3 -m /tmp/manual_check -y
   ```
+  When files are moved for manual review they are organized into numbered subfolders under the manual-check folder (e.g. `pair_001/`, `pair_002/`), each containing the two files and an `info.txt` describing the pair.
 - Show cache DB status for a folder:
   ```bash
   ./DuPiCheck.sh status /path/to/images

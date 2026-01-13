@@ -119,7 +119,9 @@ class App:
             messagebox.showerror("Error", "Manual threshold must be an integer")
             return
         res = delete_with_checks(self.duplicates, target, manual_threshold=manual_thr)
-        messagebox.showinfo("Done", f"Deleted: {len(res.get('deleted', []))}, Moved for manual: {len(res.get('moved', []))}")
+        pairs = len(res.get('moved_pairs', []))
+        files = len(res.get('moved', []))
+        messagebox.showinfo("Done", f"Deleted: {len(res.get('deleted', []))}, Moved for manual: {pairs} pairs ({files} files)")
 
 
 if __name__ == "__main__":
