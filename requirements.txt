@@ -1,3 +1,4 @@
 Pillow
 ImageHash
 tqdm
+pytest

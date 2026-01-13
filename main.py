@@ -64,14 +64,24 @@ def compute_hashes(image_paths, db_path=None, use_db=True, rebuild=False, progre
                     path TEXT PRIMARY KEY,
                     hash TEXT,
                     mtime REAL,
-                    size INTEGER
+                    size INTEGER,
+                    ignored INTEGER DEFAULT 0
                 )
                 """
             )
+            # ensure ignored column exists for older DBs
+            cur.execute("PRAGMA table_info(images)")
+            cols = [r[1] for r in cur.fetchall()]
+            if 'ignored' not in cols:
+                try:
+                    cur.execute("ALTER TABLE images ADD COLUMN ignored INTEGER DEFAULT 0")
+                except Exception:
+                    pass
             conn.commit()
-            cur.execute("SELECT path, hash, mtime, size FROM images")
+            cur.execute("SELECT path, hash, mtime, size, COALESCE(ignored,0) FROM images")
             for r in cur.fetchall():
-                db_entries[r[0]] = (r[1], r[2], r[3])
+                # store hash, mtime, size, ignored
+                db_entries[r[0]] = (r[1], r[2], r[3], r[4])
         except Exception as e:
             print(f"Warning: could not open DB {db_path}: {e}")
             if conn:
@@ -97,7 +107,8 @@ def compute_hashes(image_paths, db_path=None, use_db=True, rebuild=False, progre
 
                 if cur and not rebuild:
                     entry = db_entries.get(path)
-                    if entry and entry[1] == mtime and entry[2] == size:
+                    # only use cached entry if not marked ignored (entry[3] == 1 means ignored)
+                    if entry and entry[1] == mtime and entry[2] == size and (len(entry) < 4 or entry[3] == 0):
                         try:
                             hashes[path] = imagehash.hex_to_hash(entry[0])
                             used_cached = True
@@ -128,7 +139,8 @@ def compute_hashes(image_paths, db_path=None, use_db=True, rebuild=False, progre
 
                 if cur and not rebuild:
                     entry = db_entries.get(path)
-                    if entry and entry[1] == mtime and entry[2] == size:
+                    # only use cached entry if not marked ignored (entry[3] == 1 means ignored)
+                    if entry and entry[1] == mtime and entry[2] == size and (len(entry) < 4 or entry[3] == 0):
                         try:
                             hashes[path] = imagehash.hex_to_hash(entry[0])
                             used_cached = True
@@ -165,12 +177,19 @@ def compute_hashes(image_paths, db_path=None, use_db=True, rebuild=False, progre
 
     return hashes
 
-def find_duplicates(hashes, threshold=HASH_DISTANCE_THRESHOLD):
+def find_duplicates(hashes, threshold=HASH_DISTANCE_THRESHOLD, ignored_pairs=None):
+    """Find duplicate pairs from hashes, skipping any pair present in `ignored_pairs` set.
+
+    `ignored_pairs` should be a set of frozenset({path1, path2})."""
     duplicates = []
     used = set()
+    ignored_pairs = ignored_pairs or set()
 
     for (p1, h1), (p2, h2) in combinations(hashes.items(), 2):
         if p1 in used or p2 in used:
+            continue
+        # skip if this exact pair is marked ignored
+        if frozenset((p1, p2)) in ignored_pairs:
             continue
         if h1 - h2 <= threshold:
             duplicates.append((p1, p2, h1 - h2))
@@ -302,6 +321,158 @@ def db_status(db_path):
 
     return {"entries": cnt, "min_mtime": min_mtime, "max_mtime": max_mtime, "db_mtime": db_stat_mtime, "db_size": db_size}
 
+
+def set_ignored(paths, db_path):
+    """Mark given file paths as ignored in the DB (create/update entries)."""
+    if not db_path:
+        return
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS images (
+                path TEXT PRIMARY KEY,
+                hash TEXT,
+                mtime REAL,
+                size INTEGER,
+                ignored INTEGER DEFAULT 0
+            )
+            """
+        )
+        # ensure ignored column
+        cur.execute("PRAGMA table_info(images)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'ignored' not in cols:
+            try:
+                cur.execute("ALTER TABLE images ADD COLUMN ignored INTEGER DEFAULT 0")
+            except Exception:
+                pass
+
+        for p in paths:
+            try:
+                if os.path.exists(p):
+                    st = os.stat(p)
+                    with Image.open(p) as img:
+                        h = str(imagehash.phash(img))
+                    cur.execute(
+                        "REPLACE INTO images (path, hash, mtime, size, ignored) VALUES (?,?,?,?,1)",
+                        (p, h, st.st_mtime, st.st_size),
+                    )
+                else:
+                    # if file doesn't exist, just mark ignored by path (hash NULL)
+                    cur.execute(
+                        "REPLACE INTO images (path, hash, mtime, size, ignored) VALUES (?,?,?,?,1)",
+                        (p, None, 0, 0),
+                    )
+            except Exception as e:
+                print(f"Warning: could not mark {p} ignored: {e}")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error updating DB {db_path}: {e}")
+
+
+def reintegrate_manual(manual_dir, db_file=None, dry_run=False, remove_empty=True, mark_ignored_if_both=True):
+    """Restore files from manual pair folders back to original locations.
+
+    Expects pair folders (pair_###) inside `manual_dir` and an `info.txt` in each that contains
+    lines `Original1: <path>` and `Original2: <path>` (written by `delete_with_checks`).
+
+    If both files are restored and `mark_ignored_if_both` is True, this will set `ignored` in the DB
+    for both restored file paths so future scans will ignore them as duplicates.
+    """
+    if not os.path.isdir(manual_dir):
+        print(f"Manual directory not found: {manual_dir}")
+        return
+
+    moved_back = []
+    pairs_restored = []
+
+    for entry in sorted(os.listdir(manual_dir)):
+        pair_path = os.path.join(manual_dir, entry)
+        if not os.path.isdir(pair_path):
+            continue
+        info_file = os.path.join(pair_path, "info.txt")
+        origs = []
+        if os.path.exists(info_file):
+            try:
+                with open(info_file, "r") as f:
+                    for line in f:
+                        if line.startswith("Original1:") or line.startswith("Original2:"):
+                            origs.append(line.split(":", 1)[1].strip())
+            except Exception:
+                pass
+
+        # map basename -> original path (best effort)
+        basename_map = {os.path.basename(p): p for p in origs}
+
+        files_in_pair = [f for f in os.listdir(pair_path) if f != 'info.txt']
+        restored = []
+        for fname in files_in_pair:
+            src = os.path.join(pair_path, fname)
+            dest = None
+            # if we have original path, use it; otherwise restore to parent of manual_dir
+            if fname in basename_map:
+                intended = basename_map[fname]
+                dest_dir = os.path.dirname(intended)
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = _unique_dest_path(dest_dir, fname)
+            else:
+                # fallback: restore to manual_dir parent
+                parent = os.path.dirname(manual_dir)
+                dest = _unique_dest_path(parent, fname)
+
+            if dry_run:
+                print(f"Would move {src} -> {dest}")
+            else:
+                try:
+                    shutil.move(src, dest)
+                    moved_back.append(dest)
+                    restored.append(dest)
+                except Exception as e:
+                    print(f"Failed to move {src} -> {dest}: {e}")
+
+        if restored:
+            pairs_restored.append((pair_path, restored))
+
+        # remove pair folder if empty
+        if remove_empty and not dry_run:
+            try:
+                if not os.listdir(pair_path):
+                    os.rmdir(pair_path)
+            except Exception:
+                pass
+
+    # if required, mark ignored in DB when both files in a pair were restored
+    if mark_ignored_if_both and pairs_restored and db_file:
+        for pair_path, restored in pairs_restored:
+            if len(restored) >= 2:
+                # mark the restored paths as ignored
+                set_ignored(restored, db_file)
+                # also record the pair so the two files are not compared to each other
+                try:
+                    conn = sqlite3.connect(db_file)
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS ignored_pairs (
+                            p1 TEXT,
+                            p2 TEXT
+                        )
+                        """
+                    )
+                    p1, p2 = restored[0], restored[1]
+                    cur.execute("REPLACE INTO ignored_pairs (p1, p2) VALUES (?,?)", (p1, p2))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+
+    print(f"Restored {len(moved_back)} files from manual dir {manual_dir}")
+    return {"restored": moved_back, "pairs": pairs_restored}
+
 # ================= CLI =================
 
 def print_duplicates(duplicates):
@@ -313,6 +484,85 @@ def print_duplicates(duplicates):
     print(f"\nFound {len(duplicates)} duplicates.")
 
 
+def load_ignored_pairs(db_path):
+    pairs = set()
+    if not db_path or not os.path.exists(db_path):
+        return pairs
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ignored_pairs (
+                p1 TEXT,
+                p2 TEXT
+            )
+            """
+        )
+        cur.execute("SELECT p1, p2 FROM ignored_pairs")
+        for a, b in cur.fetchall():
+            pairs.add(frozenset((a, b)))
+        conn.close()
+    except Exception:
+        pass
+    return pairs
+
+
+def list_ignored_pairs(db_path):
+    """Return an ordered list of (p1, p2) tuples from `ignored_pairs` table."""
+    pairs = []
+    if not db_path or not os.path.exists(db_path):
+        return pairs
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ignored_pairs (
+                p1 TEXT,
+                p2 TEXT
+            )
+            """
+        )
+        cur.execute("SELECT p1, p2 FROM ignored_pairs")
+        for a, b in cur.fetchall():
+            pairs.append((a, b))
+        conn.close()
+    except Exception:
+        pass
+    return pairs
+
+
+def print_ignored_pairs(db_path):
+    pairs = list_ignored_pairs(db_path)
+    if not pairs:
+        print("No ignored pairs recorded.")
+        return pairs
+    for i, (a, b) in enumerate(pairs, start=1):
+        print(f"{i}: {a}  <->  {b}")
+    print(f"\nTotal ignored pairs: {len(pairs)}")
+    return pairs
+
+
+def remove_ignored_pair(db_path, p1, p2):
+    """Remove a pair entry matching p1/p2 (order-insensitive). Returns True if removed."""
+    if not db_path or not os.path.exists(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM ignored_pairs WHERE (p1=? AND p2=?) OR (p1=? AND p2=?)",
+            (p1, p2, p2, p1),
+        )
+        conn.commit()
+        affected = cur.rowcount
+        conn.close()
+        return affected > 0
+    except Exception:
+        return False
+
+
 def scan_folder(folder, threshold, use_db=True, rebuild_cache=False, db_file=None):
     print(f"Scanning folder: {folder}")
     paths = get_image_paths(folder)
@@ -321,7 +571,8 @@ def scan_folder(folder, threshold, use_db=True, rebuild_cache=False, db_file=Non
     if not use_db:
         db_path = None
     hashes = compute_hashes(paths, db_path=db_path, use_db=(use_db and db_path is not None), rebuild=rebuild_cache)
-    duplicates = find_duplicates(hashes, threshold=threshold)
+    ignored = load_ignored_pairs(db_path) if db_path else set()
+    duplicates = find_duplicates(hashes, threshold=threshold, ignored_pairs=ignored)
     print_duplicates(duplicates)
     return duplicates
 
@@ -359,6 +610,20 @@ def main():
     p_status.add_argument("folder", help="Folder to inspect (used to find .dupicheck.db)")
     p_status.add_argument("--db-file", help="Path to DB file to use for status (default: <folder>/.dupicheck.db)")
 
+    p_ignored = subparsers.add_parser("ignored", help="List/manage ignored pairs")
+    ignored_sub = p_ignored.add_subparsers(dest="ignored_command", required=True)
+
+    p_ignored_list = ignored_sub.add_parser("list", help="List ignored pairs")
+    p_ignored_list.add_argument("folder", help="Folder to inspect (used to find .dupicheck.db)")
+    p_ignored_list.add_argument("--db-file", help="Path to DB file to use (default: <folder>/.dupicheck.db)")
+
+    p_ignored_remove = ignored_sub.add_parser("remove", help="Remove an ignored pair by index or by providing both paths")
+    p_ignored_remove.add_argument("folder", help="Folder to inspect (used to find .dupicheck.db)")
+    group = p_ignored_remove.add_mutually_exclusive_group(required=True)
+    group.add_argument("-i", "--index", type=int, help="Index (shown by `ignored list`) of the pair to remove (1-based)")
+    group.add_argument("-p", "--paths", nargs=2, help="Two file paths comprising the pair to remove (order-insensitive)")
+    p_ignored_remove.add_argument("--db-file", help="Path to DB file to use (default: <folder>/.dupicheck.db)")
+
     args = parser.parse_args()
 
     if args.command == "scan":
@@ -384,6 +649,30 @@ def main():
     elif args.command == "status":
         db_path = args.db_file if getattr(args, 'db_file', None) else os.path.join(args.folder, ".dupicheck.db")
         db_status(db_path)
+    elif args.command == "ignored":
+        db_path = args.db_file if getattr(args, 'db_file', None) else os.path.join(args.folder, ".dupicheck.db")
+        if args.ignored_command == "list":
+            print_ignored_pairs(db_path)
+        elif args.ignored_command == "remove":
+            if getattr(args, 'index', None):
+                idx = args.index
+                pairs = list_ignored_pairs(db_path)
+                if idx < 1 or idx > len(pairs):
+                    print(f"Index {idx} out of range")
+                    sys.exit(1)
+                p1, p2 = pairs[idx - 1]
+                ok = remove_ignored_pair(db_path, p1, p2)
+                if ok:
+                    print(f"Removed ignored pair {idx}: {p1} <-> {p2}")
+                else:
+                    print("Failed to remove pair (maybe already removed).")
+            elif getattr(args, 'paths', None):
+                p1, p2 = args.paths
+                ok = remove_ignored_pair(db_path, p1, p2)
+                if ok:
+                    print(f"Removed ignored pair: {p1} <-> {p2}")
+                else:
+                    print("Pair not found or failed to remove.")
 
 
 if __name__ == "__main__":

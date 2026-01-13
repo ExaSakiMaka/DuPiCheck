@@ -57,6 +57,27 @@ Status notes
 - Default DB path: `<folder>/.dupicheck.db` (can be overridden with `--db-file`).
 - Output includes number of cached entries and DB file info.
 
+Reintegrate manual checks
+- After manually reviewing pairs moved to a manual folder, use `reintegrate_manual.py` to move the files back to their (original) locations and optionally mark them ignored in the DB so future runs won't consider those two files a duplicate pair.
+
+Example:
+```bash
+# restore and mark ignored when both files in a pair are restored
+./reintegrate_manual.py test/manual_check --db-file test/.dupicheck.db
+```
+Options:
+- `--dry-run` : show actions without moving files
+- `--no-remove` : do not remove empty pair folders after restoring
+- `--no-mark` : do not mark restored pairs as ignored in DB
+
+Manage ignored pairs
+- You can list and remove ignored pairs recorded in the DB with the `ignored` command:
+  - List (shows numbered pairs): `./DuPiCheck.sh ignored list /path/to/images` (or `python main.py ignored list /path`)
+  - Remove by index (use the index shown by `ignored list`): `./DuPiCheck.sh ignored remove /path -i 1`
+  - Remove by paths: `./DuPiCheck.sh ignored remove /path -p /path/to/a.jpg /path/to/b.jpg`
+Notes:
+- The ignored commands use the per-folder DB at `<folder>/.dupicheck.db` by default; pass `--db-file` to override.
+
 Short flags
 - `-t` / `--threshold` : hash distance threshold (scan/move/delete)
 - `-y` / `--yes`       : skip confirmation for `delete`
@@ -87,8 +108,15 @@ Project status / verification
   - Scripts: `DuPiCheck.sh` and `install.sh` are executable
   - Imports: `main` and `gui` import correctly when running inside the created `venv`
 - Suggested next steps:
-  - Add unit tests for `compute_hashes`, `find_duplicates`, and `delete_with_checks`
+  - Add unit tests for `compute_hashes`, `find_duplicates`, and `delete_with_checks` (tests use `pytest`)
   - Add CI to run linting and tests on each push
+
+Run tests locally:
+
+```bash
+pip install -r requirements.txt
+pytest
+```
 
 Notes
 - The `delete` command keeps the largest file in a pair and deletes the other. Pairs with distance greater than the manual-threshold (`-M`) are moved to the manual-check folder for review.
