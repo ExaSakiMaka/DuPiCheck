@@ -66,6 +66,7 @@ GUI
   source venv/bin/activate
   python gui.py
   ```
+**/!\ GUI IS SHITTY AND MADE FOR FUN, EXPECT BUGS
 
 Notes
 - The `delete` command keeps the largest file in a pair and deletes the other. Pairs with distance greater than the manual-threshold (`-M`) are moved to the manual-check folder for review.
