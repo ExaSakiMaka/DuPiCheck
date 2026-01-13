@@ -25,6 +25,9 @@ ENV/
 env/
 venv.bak/
 
+#test folder
+test/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

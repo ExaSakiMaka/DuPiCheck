@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 from itertools import combinations
+import sqlite3
 
 # dependencies: guard imports with helpful messages
 try:
@@ -36,14 +37,132 @@ def get_image_paths(folder):
                 paths.append(os.path.join(root, f))
     return paths
 
-def compute_hashes(image_paths):
+def compute_hashes(image_paths, db_path=None, use_db=True, rebuild=False, progress_callback=None):
+    """Compute perceptual hashes for image paths.
+
+    If `db_path` is provided and `use_db` is True, use an SQLite DB to cache hashes keyed by
+    file path, mtime and size to avoid recomputing unchanged images. If `rebuild` is True,
+    recompute all hashes and update the DB.
+
+    Progress behavior:
+      - If `progress_callback` is provided it will be called as progress_callback(index, total, path).
+      - Otherwise a tqdm progress bar is shown by default (if available).
+    """
     hashes = {}
-    for path in tqdm(image_paths, desc="Hashing images"):
+
+    conn = None
+    cur = None
+    db_entries = {}
+
+    if use_db and db_path:
         try:
-            with Image.open(path) as img:
-                hashes[path] = imagehash.phash(img)
-        except:
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS images (
+                    path TEXT PRIMARY KEY,
+                    hash TEXT,
+                    mtime REAL,
+                    size INTEGER
+                )
+                """
+            )
+            conn.commit()
+            cur.execute("SELECT path, hash, mtime, size FROM images")
+            for r in cur.fetchall():
+                db_entries[r[0]] = (r[1], r[2], r[3])
+        except Exception as e:
+            print(f"Warning: could not open DB {db_path}: {e}")
+            if conn:
+                conn.close()
+            conn = None
+            cur = None
+
+    total = len(image_paths)
+
+    # If a callback is provided, use it; otherwise show tqdm progress by default
+    if progress_callback:
+        for i, path in enumerate(image_paths):
+            try:
+                progress_callback(i + 1, total, path)
+            except Exception:
+                pass
+
+            try:
+                st = os.stat(path)
+                mtime = st.st_mtime
+                size = st.st_size
+                used_cached = False
+
+                if cur and not rebuild:
+                    entry = db_entries.get(path)
+                    if entry and entry[1] == mtime and entry[2] == size:
+                        try:
+                            hashes[path] = imagehash.hex_to_hash(entry[0])
+                            used_cached = True
+                        except Exception:
+                            used_cached = False
+
+                if not used_cached:
+                    with Image.open(path) as img:
+                        h = imagehash.phash(img)
+                        hashes[path] = h
+                        if cur:
+                            cur.execute(
+                                "REPLACE INTO images (path, hash, mtime, size) VALUES (?,?,?,?)",
+                                (path, str(h), mtime, size),
+                            )
+            except Exception:
+                pass
+    else:
+        # use tqdm by default for a visual progress bar
+        tq = tqdm(total=total, desc="Hashing images", unit='img')
+        for i, path in enumerate(image_paths):
+            try:
+                tq.set_description(f"Hashing: {os.path.basename(path)}")
+                st = os.stat(path)
+                mtime = st.st_mtime
+                size = st.st_size
+                used_cached = False
+
+                if cur and not rebuild:
+                    entry = db_entries.get(path)
+                    if entry and entry[1] == mtime and entry[2] == size:
+                        try:
+                            hashes[path] = imagehash.hex_to_hash(entry[0])
+                            used_cached = True
+                        except Exception:
+                            used_cached = False
+
+                if not used_cached:
+                    with Image.open(path) as img:
+                        h = imagehash.phash(img)
+                        hashes[path] = h
+                        if cur:
+                            cur.execute(
+                                "REPLACE INTO images (path, hash, mtime, size) VALUES (?,?,?,?)",
+                                (path, str(h), mtime, size),
+                            )
+            except Exception:
+                pass
+            tq.update(1)
+        tq.close()
+
+    # remove DB entries for files that no longer exist
+    if cur:
+        try:
+            existing = set(image_paths)
+            cur.execute("SELECT path FROM images")
+            for (p,) in cur.fetchall():
+                if p not in existing:
+                    cur.execute("DELETE FROM images WHERE path=?", (p,))
+            conn.commit()
+        except Exception:
             pass
+        finally:
+            conn.close()
+
     return hashes
 
 def find_duplicates(hashes, threshold=HASH_DISTANCE_THRESHOLD):
@@ -130,6 +249,41 @@ def delete_with_checks(duplicates, manual_dir, manual_threshold=2):
 
     return {"moved": moved_for_manual, "deleted": deleted, "kept": kept}
 
+
+def db_status(db_path):
+    """Return basic statistics about the cache DB: number of entries and mtime ranges."""
+    if not db_path or not os.path.exists(db_path):
+        print(f"DB file not found: {db_path}")
+        return None
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), MIN(mtime), MAX(mtime) FROM images")
+        cnt, min_mtime, max_mtime = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        print(f"Error reading DB {db_path}: {e}")
+        return None
+
+    try:
+        db_stat_mtime = os.path.getmtime(db_path)
+        db_size = os.path.getsize(db_path)
+    except Exception:
+        db_stat_mtime = None
+        db_size = None
+
+    print(f"DB: {db_path}")
+    print(f"  Entries: {cnt}")
+    if min_mtime and max_mtime:
+        print(f"  Images mtime range: {min_mtime} - {max_mtime}")
+    if db_stat_mtime:
+        print(f"  DB file mtime: {db_stat_mtime}")
+    if db_size is not None:
+        print(f"  DB file size: {db_size} bytes")
+
+    return {"entries": cnt, "min_mtime": min_mtime, "max_mtime": max_mtime, "db_mtime": db_stat_mtime, "db_size": db_size}
+
 # ================= CLI =================
 
 def print_duplicates(duplicates):
@@ -141,10 +295,14 @@ def print_duplicates(duplicates):
     print(f"\nFound {len(duplicates)} duplicates.")
 
 
-def scan_folder(folder, threshold):
+def scan_folder(folder, threshold, use_db=True, rebuild_cache=False, db_file=None):
     print(f"Scanning folder: {folder}")
     paths = get_image_paths(folder)
-    hashes = compute_hashes(paths)
+    # determine DB path (per-folder default)
+    db_path = db_file if db_file else os.path.join(folder, ".dupicheck.db")
+    if not use_db:
+        db_path = None
+    hashes = compute_hashes(paths, db_path=db_path, use_db=(use_db and db_path is not None), rebuild=rebuild_cache)
     duplicates = find_duplicates(hashes, threshold=threshold)
     print_duplicates(duplicates)
     return duplicates
@@ -157,11 +315,17 @@ def main():
     p_scan = subparsers.add_parser("scan", help="Scan folder for duplicate images")
     p_scan.add_argument("folder", help="Folder to scan")
     p_scan.add_argument("-t", "--threshold", type=int, default=HASH_DISTANCE_THRESHOLD, help="Hash distance threshold")
+    p_scan.add_argument("--no-cache", "-n", action="store_true", help="Disable cache, recompute all hashes")
+    p_scan.add_argument("--rebuild-cache", "-r", action="store_true", help="Force recompute and update cache")
+    p_scan.add_argument("--db-file", help="Path to DB file to use for caching (default: <folder>/.dupicheck.db)")
 
     p_move = subparsers.add_parser("move", help="Move duplicates to target folder")
     p_move.add_argument("folder", help="Folder to scan")
     p_move.add_argument("target", help="Destination folder")
     p_move.add_argument("-t", "--threshold", type=int, default=HASH_DISTANCE_THRESHOLD, help="Hash distance threshold")
+    p_move.add_argument("--no-cache", "-n", action="store_true", help="Disable cache, recompute all hashes")
+    p_move.add_argument("--rebuild-cache", "-r", action="store_true", help="Force recompute and update cache")
+    p_move.add_argument("--db-file", help="Path to DB file to use for caching (default: <folder>/.dupicheck.db)")
 
     p_delete = subparsers.add_parser("delete", help="Delete duplicate images")
     p_delete.add_argument("folder", help="Folder to scan")
@@ -169,19 +333,26 @@ def main():
     p_delete.add_argument("-t", "--threshold", type=int, default=HASH_DISTANCE_THRESHOLD, help="Hash distance threshold")
     p_delete.add_argument("-m", "--manual-dir", help="Directory to move uncertain pairs for manual check (default: <folder>_manual_check)")
     p_delete.add_argument("-M", "--manual-threshold", type=int, default=2, help="Distance above which pairs are moved for manual check (default: 2)")
+    p_delete.add_argument("--no-cache", "-n", action="store_true", help="Disable cache, recompute all hashes")
+    p_delete.add_argument("--rebuild-cache", "-r", action="store_true", help="Force recompute and update cache")
+    p_delete.add_argument("--db-file", help="Path to DB file to use for caching (default: <folder>/.dupicheck.db)")
+
+    p_status = subparsers.add_parser("status", help="Show cache DB status for a folder")
+    p_status.add_argument("folder", help="Folder to inspect (used to find .dupicheck.db)")
+    p_status.add_argument("--db-file", help="Path to DB file to use for status (default: <folder>/.dupicheck.db)")
 
     args = parser.parse_args()
 
     if args.command == "scan":
-        scan_folder(args.folder, args.threshold)
+        scan_folder(args.folder, args.threshold, use_db=not args.no_cache, rebuild_cache=args.rebuild_cache, db_file=args.db_file)
     elif args.command == "move":
-        duplicates = scan_folder(args.folder, args.threshold)
+        duplicates = scan_folder(args.folder, args.threshold, use_db=not args.no_cache, rebuild_cache=args.rebuild_cache, db_file=args.db_file)
         if not duplicates:
             sys.exit(0)
         move_duplicates(duplicates, args.target)
         print("Duplicates moved successfully.")
     elif args.command == "delete":
-        duplicates = scan_folder(args.folder, args.threshold)
+        duplicates = scan_folder(args.folder, args.threshold, use_db=not args.no_cache, rebuild_cache=args.rebuild_cache, db_file=args.db_file)
         if not duplicates:
             sys.exit(0)
         if not args.yes:
@@ -192,6 +363,9 @@ def main():
         manual_dir = args.manual_dir if getattr(args, 'manual_dir', None) else os.path.join(args.folder, "manual_check")
         res = delete_with_checks(duplicates, manual_dir, manual_threshold=args.manual_threshold)
         print("Done.")
+    elif args.command == "status":
+        db_path = args.db_file if getattr(args, 'db_file', None) else os.path.join(args.folder, ".dupicheck.db")
+        db_status(db_path)
 
 
 if __name__ == "__main__":
