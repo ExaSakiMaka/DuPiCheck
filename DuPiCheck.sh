@@ -6,14 +6,16 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$DIR/venv"
 
-# Parse launcher-only flags (consumed by this script): --install, --no-install
+# Parse launcher-only flags (consumed by this script): --install, --no-install, --reintegrate (-R)
 INSTALL=false
 NO_INSTALL=false
+REINTEGRATE=false
 ARGS=()
 for a in "$@"; do
   case "$a" in
     --install) INSTALL=true ;;
     --no-install) NO_INSTALL=true ;;
+    -R|--reintegrate) REINTEGRATE=true ;;
     *) ARGS+=("$a") ;;
   esac
 done
@@ -53,4 +55,8 @@ else
   fi
 fi
 
-exec python "$DIR/main.py" "${ARGS[@]:-}"
+if [ "$REINTEGRATE" = "true" ]; then
+  exec python "$DIR/reintegrate_manual.py" "${ARGS[@]:-}"
+else
+  exec python "$DIR/main.py" "${ARGS[@]:-}"
+fi

@@ -63,7 +63,11 @@ Reintegrate manual checks
 Example:
 ```bash
 # restore and mark ignored when both files in a pair are restored
-./reintegrate_manual.py test/manual_check --db-file test/.dupicheck.db
+./reintegrate_manual.py /path/to/manual_check --db-file /path/to/.dupicheck.db
+# or use the launcher and run the reintegration tool:
+./DuPiCheck.sh --reintegrate /path/to/manual_check --db-file /path/to/.dupicheck.db
+# short flag:
+./DuPiCheck.sh -R /path/to/manual_check --db-file /path/to/.dupicheck.db
 ```
 Options:
 - `--dry-run` : show actions without moving files
